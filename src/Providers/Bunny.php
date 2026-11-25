@@ -746,6 +746,7 @@ class Bunny implements DnsHostingProviderInterface
      * - Uses AccessKey header for auth.
      * - Sends JSON bodies for POST/PUT when $body is not null.
      * - If response is JSON, returns array; otherwise returns string.
+     * - Retenta 429/503 no maximo 3 vezes, respeitando Retry-After (cap 3s).
      */
     private function request(string $method, string $path, ?array $body = null, array $extraHeaders = [])
     {
@@ -774,20 +775,44 @@ class Bunny implements DnsHostingProviderInterface
             else $headers[] = $k . ': ' . $v;
         }
 
+        $responseHeaders = [];
         curl_setopt_array($ch, [
             CURLOPT_CUSTOMREQUEST  => strtoupper($method),
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_HTTPHEADER     => $headers,
             CURLOPT_TIMEOUT        => 30,
+            CURLOPT_HEADERFUNCTION => function ($ch, $line) use (&$responseHeaders) {
+                $pos = strpos($line, ':');
+                if ($pos !== false) {
+                    $name = strtolower(trim(substr($line, 0, $pos)));
+                    $responseHeaders[$name] = trim(substr($line, $pos + 1));
+                }
+                return strlen($line);
+            },
         ]);
 
-        $raw = curl_exec($ch);
-        if ($raw === false) {
-            $err = curl_error($ch);
-            throw new \Exception("HTTP request failed: {$err}");
-        }
+        // 429/503: backoff limitado. Nao retenta 5xx generico para evitar
+        // duplicar escrita quando o servidor ja processou o POST.
+        $maxAttempts = 3;
+        $attempt = 0;
+        do {
+            $attempt++;
+            $responseHeaders = [];
+            $raw = curl_exec($ch);
+            if ($raw === false) {
+                $err = curl_error($ch);
+                throw new \Exception("HTTP request failed: {$err}");
+            }
 
-        $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            if (($status === 429 || $status === 503) && $attempt < $maxAttempts) {
+                usleep($this->retryDelayMs($responseHeaders, $attempt) * 1000);
+                continue;
+            }
+
+            break;
+        } while (true);
+
         $contentType = (string)(curl_getinfo($ch, CURLINFO_CONTENT_TYPE) ?: '');
 
         if ($status >= 400) {
@@ -820,5 +845,22 @@ class Bunny implements DnsHostingProviderInterface
         }
 
         return $raw;
+    }
+
+    /**
+     * Delay antes da proxima tentativa: Retry-After (segundos) se presente,
+     * senao 500ms x tentativa. Teto de 3s para nao estourar o request do WHMCS.
+     */
+    private function retryDelayMs(array $headers, int $attempt): int
+    {
+        $retryAfter = $headers['retry-after'] ?? null;
+        if (is_string($retryAfter) && $retryAfter !== '' && ctype_digit($retryAfter)) {
+            $seconds = (int)$retryAfter;
+            if ($seconds > 0) {
+                return min($seconds, 3) * 1000;
+            }
+        }
+
+        return min(500 * $attempt, 1500);
     }
 }
