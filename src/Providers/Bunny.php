@@ -15,6 +15,11 @@ class Bunny implements DnsHostingProviderInterface
     /** @var array<string,int> map domain => zoneId */
     private array $zoneIdCache = [];
 
+    /** Nameservers/SOA customizados aplicados por zona (Bunny e por zona). */
+    private ?string $customNs1 = null;
+    private ?string $customNs2 = null;
+    private ?string $soaEmail = null;
+
     private const TYPE_MAP = [
         'A'     => 0,
         'AAAA'  => 1,
@@ -39,6 +44,15 @@ class Bunny implements DnsHostingProviderInterface
         }
         $this->apiKey = $key;
 
+        if (is_array($config)) {
+            $this->customNs1 = $this->normalizeHostname((string)($config['ns1'] ?? ''));
+            $this->customNs2 = $this->normalizeHostname((string)($config['ns2'] ?? ''));
+            $email = trim((string)($config['soa_email'] ?? ''));
+            if ($email !== '' && filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                $this->soaEmail = $email;
+            }
+        }
+
         $domainName = $config['domain_name'] ?? null;
         $zoneId = $config['zone_id'] ?? null;
         if (is_string($domainName) && is_numeric($zoneId)) {
@@ -56,15 +70,57 @@ class Bunny implements DnsHostingProviderInterface
 
         try {
             $resp = $this->request('POST', '/dnszone', ['Domain' => $domainName]);
-
-            if (is_array($resp) && isset($resp['Id']) && is_numeric($resp['Id'])) {
-                $this->zoneIdCache[$domainName] = (int)$resp['Id'];
-            }
-
-            return $resp;
         } catch (\Throwable $e) {
             throw new \Exception("Error creating domain: " . $e->getMessage());
         }
+
+        if (is_array($resp) && isset($resp['Id']) && is_numeric($resp['Id'])) {
+            $zoneId = (int)$resp['Id'];
+            $this->zoneIdCache[$domainName] = $zoneId;
+
+            // No Bunny, custom nameservers e SOA sao por zona.
+            $this->applyZoneSettings($zoneId);
+        }
+
+        return $resp;
+    }
+
+    /**
+     * Aplica nameservers customizados e SOA na zona recem-criada.
+     * So envia quando o config traz ns1+ns2 e/ou um e-mail de SOA valido.
+     */
+    private function applyZoneSettings(int $zoneId): void
+    {
+        $body = [];
+
+        if ($this->customNs1 !== null && $this->customNs2 !== null) {
+            $body['CustomNameserversEnabled'] = true;
+            $body['Nameserver1'] = $this->customNs1;
+            $body['Nameserver2'] = $this->customNs2;
+        }
+        if ($this->soaEmail !== null) {
+            $body['SoaEmail'] = $this->soaEmail;
+        }
+
+        if ($body === []) {
+            return;
+        }
+
+        try {
+            $this->request('POST', '/dnszone/' . $zoneId, $body);
+        } catch (\Throwable $e) {
+            throw new \Exception('Zone created but nameserver/SOA settings failed: ' . $e->getMessage());
+        }
+    }
+
+    private function normalizeHostname(string $host): ?string
+    {
+        $host = strtolower(rtrim(trim($host), '.'));
+        if ($host === '' || !preg_match('/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/', $host)) {
+            return null;
+        }
+
+        return $host;
     }
 
     public function listDomains()
